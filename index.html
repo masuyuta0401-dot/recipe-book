@@ -975,72 +975,138 @@ function autoFetchOnPaste(){
     fetchFromUrl();
   }, 600);
 }
+async function apiScrape(url){
+  try{
+    const ctrl = new AbortController();
+    const tm = setTimeout(()=>ctrl.abort(), 15000);
+    const r = await fetch('/api/scrape?url=' + encodeURIComponent(url), {signal: ctrl.signal});
+    clearTimeout(tm);
+    if(r.ok) return await r.json();
+  }catch(e){}
+  return null;
+}
+async function imageToPhoto(imgUrl, baseUrl){
+  /* 画像を取得→720px/JPEG0.72に圧縮してpendingPhotoへ。成功でtrue */
+  const abs = new URL(imgUrl, baseUrl).href;
+  const tryFetch = async (u)=>{
+    try{
+      const ctrl = new AbortController();
+      const tm = setTimeout(()=>ctrl.abort(), 15000);
+      const res = await fetch(u, {signal: ctrl.signal});
+      clearTimeout(tm);
+      if(res.ok){
+        const b = await res.blob();
+        if(b.type.startsWith('image')) return b;
+      }
+    }catch(e){}
+    return null;
+  };
+  let blob = null;
+  if(/^https?:/.test(location.protocol)) blob = await tryFetch('/api/img?url=' + encodeURIComponent(abs));
+  if(!blob) blob = await tryFetch('https://images.weserv.nl/?url=' + encodeURIComponent(abs.replace(/^https?:\/\//,'')) + '&w=720');
+  if(!blob) blob = await fetchViaProxy(abs, true);
+  if(!blob || !blob.type || !blob.type.startsWith('image')) return false;
+  return await new Promise(resolve=>{
+    const img = new Image();
+    const bu = URL.createObjectURL(blob);
+    img.onload = ()=>{
+      const MAX = 720;
+      const scale = Math.min(1, MAX/Math.max(img.width,img.height));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(img.width*scale);
+      cv.height = Math.round(img.height*scale);
+      cv.getContext('2d').drawImage(img,0,0,cv.width,cv.height);
+      pendingPhoto = cv.toDataURL('image/jpeg',0.72);
+      URL.revokeObjectURL(bu);
+      showPhotoPreview();
+      resolve(true);
+    };
+    img.onerror = ()=>{ URL.revokeObjectURL(bu); resolve(false); };
+    img.src = bu;
+  });
+}
 async function fetchFromUrl(){
   const url = document.getElementById('inUrl').value.trim();
   if(!/^https?:\/\//.test(url)){ toast('先にURLを貼り付けてください'); return; }
   const btn = document.getElementById('fetchBtn');
   btn.disabled = true; btn.textContent = '取得中…';
   const isInsta = /instagram\.com|instagr\.am/.test(url);
+  const ingBox = document.getElementById('inIng');
+  const stepBox = document.getElementById('inSteps');
+  const nameBox = document.getElementById('inName');
+  let got = [];
   try{
     let title = '', image = '';
-    let got = [];
-    const html = await fetchViaProxy(url, false);
-    if(html){
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      const og = p => doc.querySelector(`meta[property="${p}"]`)?.content
-                 || doc.querySelector(`meta[name="${p}"]`)?.content || '';
-      title = cleanTitle(og('og:title') || doc.title || '');
-      image = og('og:image');
-      /* ログイン画面にリダイレクトされたケースを検出 */
-      if(/ログイン|Log in|Login/i.test(title)) { title=''; image=''; }
-      /* schema.org/Recipe から材料・作り方を抽出 */
-      try{
-        for(const sc of doc.querySelectorAll('script[type="application/ld+json"]')){
-          let j; try{ j = JSON.parse(sc.textContent); }catch(e){ continue; }
-          const nodes = [].concat(j['@graph']||j);
-          const rec = nodes.flat().find(n=>n && /Recipe/.test(String(n['@type'])));
-          if(!rec) continue;
-          if(Array.isArray(rec.recipeIngredient) && !document.getElementById('inIng').value.trim()){
-            const yieldTxt = rec.recipeYield ? `【${[].concat(rec.recipeYield)[0]}】\n` : '';
-            document.getElementById('inIng').value = yieldTxt + rec.recipeIngredient.join('\n');
-            got.push('材料');
-          }
-          const inst = rec.recipeInstructions;
-          if(inst && !document.getElementById('inSteps').value.trim()){
-            const lines = [].concat(inst).flatMap(x=>{
-              if(typeof x==='string') return [x];
-              if(x && x.text) return [x.text];
-              if(x && Array.isArray(x.itemListElement)) return x.itemListElement.map(y=>y.text||'').filter(Boolean);
-              return [];
-            }).map(t=>t.trim()).filter(Boolean);
-            if(lines.length){
-              document.getElementById('inSteps').value = lines.join('\n');
-              got.push('作り方');
-            }
-          }
-          break;
-        }
-      }catch(e){}
-      /* JSON-LDで取れなかった場合：class/idから材料・手順を推測して抽出 */
-      try{
-        if(!document.getElementById('inIng').value.trim()){
-          const lines = [...doc.querySelectorAll('[class*="ingredient" i] li, [id*="ingredient" i] li, [class*="ingredient" i] [class*="row" i]')]
-            .map(e=>e.textContent.replace(/\s+/g,' ').trim())
-            .filter(t=>t && t.length<=60);
-          const uniq = [...new Set(lines)];
-          if(uniq.length>=2) document.getElementById('inIng').value = uniq.join('\n'), got.push('材料');
-        }
-        if(!document.getElementById('inSteps').value.trim()){
-          const lines = [...doc.querySelectorAll('[class*="step" i] li, [id*="step" i] li, ol[class*="instruction" i] li')]
-            .map(e=>e.textContent.replace(/\s+/g,' ').trim())
-            .filter(t=>t && t.length>=5 && t.length<=500);
-          const uniq = [...new Set(lines)];
-          if(uniq.length>=2) document.getElementById('inSteps').value = uniq.join('\n'), got.push('作り方');
-        }
-      }catch(e){}
+
+    /* ---- ルート1: 自前API（Vercel上で動作・最優先） ---- */
+    const api = /^https?:/.test(location.protocol) ? await apiScrape(url) : null;
+    if(api){
+      if(api.title) title = cleanTitle(api.title);
+      if(api.image) image = api.image;
+      if(api.ingredients && api.ingredients.length >= 2 && !ingBox.value.trim()){
+        ingBox.value = (api.yield ? '【' + api.yield + '】\n' : '') + api.ingredients.join('\n');
+        got.push('材料');
+      }
+      if(api.steps && api.steps.length >= 2 && !stepBox.value.trim()){
+        stepBox.value = api.steps.join('\n');
+        got.push('作り方');
+      }
     }
-    /* HTML経由で取れなければ jina reader でタイトルだけ再挑戦 */
-    if(!title || (!document.getElementById('inIng').value.trim() && !document.getElementById('inSteps').value.trim())){
+
+    /* ---- ルート2: プロキシ経由でHTML解析（APIで足りない分のみ） ---- */
+    if(!title || !image || !ingBox.value.trim() || !stepBox.value.trim()){
+      const html = await fetchViaProxy(url, false);
+      if(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const og = pn => doc.querySelector(`meta[property="${pn}"]`)?.content
+                   || doc.querySelector(`meta[name="${pn}"]`)?.content || '';
+        let t2 = cleanTitle(og('og:title') || doc.title || '');
+        if(/ログイン|Log in|Login/i.test(t2)) t2 = '';
+        if(!title) title = t2;
+        if(!image && t2) image = og('og:image');
+        /* JSON-LD */
+        try{
+          for(const sc of doc.querySelectorAll('script[type="application/ld+json"]')){
+            let j; try{ j = JSON.parse(sc.textContent); }catch(e){ continue; }
+            const nodes = [].concat(j['@graph']||j);
+            const rec = nodes.flat().find(n=>n && /Recipe/.test(String(n['@type'])));
+            if(!rec) continue;
+            if(Array.isArray(rec.recipeIngredient) && rec.recipeIngredient.length>=2 && !ingBox.value.trim()){
+              const y = rec.recipeYield ? '【' + [].concat(rec.recipeYield)[0] + '】\n' : '';
+              ingBox.value = y + rec.recipeIngredient.join('\n');
+              got.push('材料');
+            }
+            const inst = rec.recipeInstructions;
+            if(inst && !stepBox.value.trim()){
+              const ls = [].concat(inst).flatMap(x=>{
+                if(typeof x==='string') return [x];
+                if(x && x.text) return [x.text];
+                if(x && Array.isArray(x.itemListElement)) return x.itemListElement.map(y=>y.text||'').filter(Boolean);
+                return [];
+              }).map(t=>t.trim()).filter(Boolean);
+              if(ls.length>=2){ stepBox.value = ls.join('\n'); got.push('作り方'); }
+            }
+            break;
+          }
+        }catch(e){}
+        /* class/idヒューリスティック */
+        try{
+          if(!ingBox.value.trim()){
+            const ls = [...new Set([...doc.querySelectorAll('[class*="ingredient" i] li, [id*="ingredient" i] li')]
+              .map(e=>e.textContent.replace(/\s+/g,' ').trim()).filter(t=>t && t.length<=60))];
+            if(ls.length>=2){ ingBox.value = ls.join('\n'); got.push('材料'); }
+          }
+          if(!stepBox.value.trim()){
+            const ls = [...new Set([...doc.querySelectorAll('[class*="step" i] li, [id*="step" i] li, ol[class*="instruction" i] li')]
+              .map(e=>e.textContent.replace(/\s+/g,' ').trim()).filter(t=>t && t.length>=5 && t.length<=500))];
+            if(ls.length>=2){ stepBox.value = ls.join('\n'); got.push('作り方'); }
+          }
+        }catch(e){}
+      }
+    }
+
+    /* ---- ルート3: テキスト変換(jina)フォールバック ---- */
+    if(!title || !ingBox.value.trim() || !stepBox.value.trim()){
       const md = await fetchViaProxy2('https://r.jina.ai/' + url);
       if(md){
         if(!title){
@@ -1051,36 +1117,27 @@ async function fetchFromUrl(){
           const im = md.match(/!\[[^\]]*\]\((https?:[^)\s]+)\)/);
           if(im) image = im[1];
         }
-        if(!document.getElementById('inIng').value.trim()){
+        if(!ingBox.value.trim()){
           const sec = md.match(/材料[^\n]*\n([\s\S]{0,1500}?)(?=\n#{1,3} |\n作り方|\n手順|$)/);
           if(sec){
-            const lines = sec[1].split('\n')
-              .map(t=>t.replace(/^[-*・\d\.\)\s]+/,'').trim())
+            const ls = sec[1].split('\n').map(t=>t.replace(/^[-*・\d\.\)\s]+/,'').trim())
               .filter(t=>t && t.length<=60 && !/^!\[|^http/.test(t));
-            if(lines.length>=2){ document.getElementById('inIng').value = lines.join('\n'); got.push('材料'); }
+            if(ls.length>=2){ ingBox.value = ls.join('\n'); got.push('材料'); }
           }
         }
-        if(!document.getElementById('inSteps').value.trim()){
+        if(!stepBox.value.trim()){
           const sec = md.match(/(?:作り方|手順)[^\n]*\n([\s\S]{0,4000}?)(?=\n#{1,3} |$)/);
           if(sec){
-            const lines = sec[1].split('\n')
-              .map(t=>t.replace(/^[-*・\d\.\)\s]+/,'').trim())
+            const ls = sec[1].split('\n').map(t=>t.replace(/^[-*・\d\.\)\s]+/,'').trim())
               .filter(t=>t && t.length>=5 && t.length<=500 && !/^!\[|^http/.test(t));
-            if(lines.length>=2){ document.getElementById('inSteps').value = lines.join('\n'); got.push('作り方'); }
+            if(ls.length>=2){ stepBox.value = ls.join('\n'); got.push('作り方'); }
           }
         }
       }
     }
-    if(!title && !image){
-      toast(isInsta
-        ? 'インスタは取得できませんでした。ログインしていても外部からは読めない仕組みです。スクショを📷から登録してください'
-        : 'ページを取得できませんでした。少し待って「再取得」を押してください');
-      return;
-    }
-    if(title && !document.getElementById('inName').value.trim()){
-      document.getElementById('inName').value = title;
-      got.push('料理名');
-    }
+
+    /* ---- 反映: 料理名・カテゴリー・写真 ---- */
+    if(title && !nameBox.value.trim()){ nameBox.value = title; got.push('料理名'); }
     if(!catTouched && !editingId){
       const guessed = guessCategories(title + ' ' + url);
       if(guessed.length){
@@ -1089,43 +1146,17 @@ async function fetchFromUrl(){
         got.push('カテゴリー');
       }
     }
-    if(image){
-      const imgUrl = new URL(image, url).href;
-      /* 画像はCORS対応の画像プロキシを優先（成功率が高い） */
-      let blob = null;
-      try{
-        const ctrl = new AbortController();
-        const tm = setTimeout(()=>ctrl.abort(), 12000);
-        const wr = await fetch('https://images.weserv.nl/?url=' + encodeURIComponent(imgUrl.replace(/^https?:\/\//,'')) + '&w=720', {signal:ctrl.signal});
-        clearTimeout(tm);
-        if(wr.ok) blob = await wr.blob();
-      }catch(e){}
-      if(!blob || !blob.type.startsWith('image')) blob = await fetchViaProxy(imgUrl, true);
-      if(blob && blob.type.startsWith('image')){
-        await new Promise(resolve=>{
-          const img = new Image();
-          const bu = URL.createObjectURL(blob);
-          img.onload = ()=>{
-            const MAX = 720;
-            const scale = Math.min(1, MAX/Math.max(img.width,img.height));
-            const cv = document.createElement('canvas');
-            cv.width = Math.round(img.width*scale);
-            cv.height = Math.round(img.height*scale);
-            cv.getContext('2d').drawImage(img,0,0,cv.width,cv.height);
-            pendingPhoto = cv.toDataURL('image/jpeg',0.72);
-            URL.revokeObjectURL(bu);
-            showPhotoPreview();
-            got.push('写真');
-            resolve();
-          };
-          img.onerror = resolve;
-          img.src = bu;
-        });
-      }
+    if(image && await imageToPhoto(image, url)) got.push('写真');
+
+    if(got.length===0){
+      toast(isInsta
+        ? 'インスタは取得できませんでした。ログインしていても外部からは読めない仕組みです。スクショを📷から登録してください'
+        : 'ページを取得できませんでした。少し待って「再取得」を押してください');
+    }else{
+      toast(got.join('・') + 'を取得しました');
     }
-    toast(got.length ? got.join('と')+'を取得しました' : 'タイトル・写真が見つかりませんでした。手入力してください');
   }finally{
-    btn.disabled = false; btn.textContent = '自動入力';
+    btn.disabled = false; btn.textContent = '再取得';
   }
 }
 
